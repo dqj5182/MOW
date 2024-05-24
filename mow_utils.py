@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
 
 """Utility functions."""
+from __future__ import division
 
 import cv2
 import math
-import matplotlib.pyplot as plt
 import neural_renderer as nr
 import numpy as np
 import torch
 import torch.nn.functional as F
-
-from PIL import Image
+import torch.nn as nn
+import numpy
 
 
 def compute_R_init(B):
@@ -176,8 +176,8 @@ class PerspectiveRenderer(object):
         self.t = torch.zeros(1, 3).cuda()
         self.default_translation = torch.cuda.FloatTensor([[0, 0, 2]])
         self.t_size = texture_size
-        self.renderer = nr.renderer.Renderer(
-            image_size=image_size, K=self.default_K, R=self.R, t=self.t, orig_size=1
+        self.renderer = Renderer(
+            image_size=image_size, K=self.default_K, R=self.R, t=self.t, orig_size=1 # cam mode: projection
         )
         self.set_light_dir([1, 1, 0.4], int_dir=0.3, int_amb=0.7)
         self.set_bgcolor([0, 0, 0])
@@ -203,20 +203,24 @@ class PerspectiveRenderer(object):
         rend = np.clip(rend, 0, 1)[0]
 
         self.renderer.K = self.default_K  # Restore just in case.
-        if image is None:
-            return rend
-        else:
-            sil = sil.detach().cpu().numpy()[0]
-            h, w, *_ = image.shape
-            L = max(h, w)
-            if image.max() > 1:
-                image = image.astype(float) / 255.0
-            new_image = np.pad(image, ((0, L - h), (0, L - w), (0, 0)))
-            new_image = cv2.resize(new_image, (self.image_size, self.image_size))
-            new_image[sil > 0] = rend[sil > 0]
-            r = self.image_size / L
-            new_image = new_image[: int(h * r), : int(w * r)]
-            return new_image
+        
+        # Render on image
+        sil = sil.detach().cpu().numpy()[0]
+        h, w, *_ = image.shape
+        L = max(h, w)
+        if image.max() > 1:
+            image = image.astype(float) / 255.0
+
+
+        new_image = np.pad(image, ((0, L - h), (0, L - w), (0, 0)))
+        new_image = cv2.resize(new_image, (self.image_size, self.image_size))
+        new_sil = cv2.resize(sil, (self.image_size, self.image_size))
+        new_image[sil > 0] = rend[sil > 0]
+        r = self.image_size / L
+        assert new_image.shape[:2] == new_sil.shape[:2]
+        new_image = new_image[: int(h * r), : int(w * r)]
+        new_sil = new_sil[: int(h * r), : int(w * r)]
+        return new_image, new_sil
 
     def set_light_dir(self, direction=(1, 0.5, -1), int_dir=0.3, int_amb=0.7):
         self.renderer.light_direction = direction
@@ -245,3 +249,167 @@ def vis_obj_pose_im(verts, faces, rot, t, scale, im, out_f, idx=0):
     cv2.imwrite(out_f, im_vis)
     print("Wrote vis obj pose im to: {}".format(out_f))
     return im_vis
+
+
+
+
+
+def projection(vertices, K, R, t, dist_coeffs, orig_size, eps=1e-9):
+    '''
+    Calculate projective transformation of vertices given a projection matrix
+    Input parameters:
+    K: batch_size * 3 * 3 intrinsic camera matrix
+    R, t: batch_size * 3 * 3, batch_size * 1 * 3 extrinsic calibration parameters
+    dist_coeffs: vector of distortion coefficients
+    orig_size: original size of image captured by the camera
+    Returns: For each point [X,Y,Z] in world coordinates [u,v,z] where u,v are the coordinates of the projection in
+    pixels and z is the depth
+    '''
+
+    # instead of P*x we compute x'*P'
+    vertices = torch.matmul(vertices, R.transpose(2,1)) + t
+    x, y, z = vertices[:, :, 0], vertices[:, :, 1], vertices[:, :, 2]
+    x_ = x / (z + eps)
+    y_ = y / (z + eps)
+
+    # Get distortion coefficients from vector
+    k1 = dist_coeffs[:, None, 0]
+    k2 = dist_coeffs[:, None, 1]
+    p1 = dist_coeffs[:, None, 2]
+    p2 = dist_coeffs[:, None, 3]
+    k3 = dist_coeffs[:, None, 4]
+
+    # we use x_ for x' and x__ for x'' etc.
+    r = torch.sqrt(x_ ** 2 + y_ ** 2)
+    x__ = x_*(1 + k1*(r**2) + k2*(r**4) + k3*(r**6)) + 2*p1*x_*y_ + p2*(r**2 + 2*x_**2)
+    y__ = y_*(1 + k1*(r**2) + k2*(r**4) + k3 *(r**6)) + p1*(r**2 + 2*y_**2) + 2*p2*x_*y_
+    vertices = torch.stack([x__, y__, torch.ones_like(z)], dim=-1)
+    vertices = torch.matmul(vertices, K.transpose(1,2))
+    u, v = vertices[:, :, 0], vertices[:, :, 1]
+    v = orig_size - v
+    # map u,v from [0, img_size] to [-1, 1] to use by the renderer
+    u = 2 * (u - orig_size / 2.) / orig_size
+    v = 2 * (v - orig_size / 2.) / orig_size
+    vertices = torch.stack([u, v, z], dim=-1)
+    return vertices
+
+
+
+def vertices_to_faces(vertices, faces):
+    """
+    :param vertices: [batch size, number of vertices, 3]
+    :param faces: [batch size, number of faces, 3)
+    :return: [batch size, number of faces, 3, 3]
+    """
+    assert (vertices.ndimension() == 3)
+    assert (faces.ndimension() == 3)
+    assert (vertices.shape[0] == faces.shape[0])
+    assert (vertices.shape[2] == 3)
+    assert (faces.shape[2] == 3)
+
+    bs, nv = vertices.shape[:2]
+    bs, nf = faces.shape[:2]
+    device = vertices.device
+    faces = faces + (torch.arange(bs, dtype=torch.int32).to(device) * nv)[:, None, None]
+    vertices = vertices.reshape((bs * nv, 3))
+    # pytorch only supports long and byte tensors for indexing
+    return vertices[faces.long()]
+
+
+
+
+class Renderer(nn.Module):
+    def __init__(self, image_size=256, anti_aliasing=True, background_color=[0,0,0],
+                 fill_back=True, camera_mode='projection',
+                 K=None, R=None, t=None, dist_coeffs=None, orig_size=1024,
+                 perspective=True, viewing_angle=30, camera_direction=[0,0,1],
+                 near=0.1, far=100,
+                 light_intensity_ambient=0.5, light_intensity_directional=0.5,
+                 light_color_ambient=[1,1,1], light_color_directional=[1,1,1],
+                 light_direction=[0,1,0]):
+        super(Renderer, self).__init__()
+        # rendering
+        self.image_size = image_size
+        self.anti_aliasing = anti_aliasing
+        self.background_color = background_color
+        self.fill_back = fill_back
+
+        # camera
+        self.camera_mode = camera_mode
+        
+        # projection
+        self.K = K
+        self.R = R
+        self.t = t
+        if isinstance(self.K, numpy.ndarray):
+            self.K = torch.cuda.FloatTensor(self.K)
+        if isinstance(self.R, numpy.ndarray):
+            self.R = torch.cuda.FloatTensor(self.R)
+        if isinstance(self.t, numpy.ndarray):
+            self.t = torch.cuda.FloatTensor(self.t)
+        self.dist_coeffs = dist_coeffs
+        if dist_coeffs is None:
+            self.dist_coeffs = torch.cuda.FloatTensor([[0., 0., 0., 0., 0.]])
+        self.orig_size = orig_size
+
+
+        self.near = near
+        self.far = far
+
+        # light
+        self.light_intensity_ambient = light_intensity_ambient
+        self.light_intensity_directional = light_intensity_directional
+        self.light_color_ambient = light_color_ambient
+        self.light_color_directional = light_color_directional
+        self.light_direction = light_direction 
+
+        # rasterization
+        self.rasterizer_eps = 1e-3
+
+
+    def render(self, vertices, faces, textures, K=None, R=None, t=None, dist_coeffs=None, orig_size=None):
+        # fill back
+        if self.fill_back:
+            faces = torch.cat((faces, faces[:, :, list(reversed(range(faces.shape[-1])))]), dim=1).detach()
+            textures = torch.cat((textures, textures.permute((0, 1, 4, 3, 2, 5))), dim=1)
+
+        # lighting
+        faces_lighting = nr.vertices_to_faces(vertices, faces)
+        textures = nr.lighting(
+            faces_lighting,
+            textures,
+            self.light_intensity_ambient,
+            self.light_intensity_directional,
+            self.light_color_ambient,
+            self.light_color_directional,
+            self.light_direction)
+
+        # viewpoint transformation
+        if K is None:
+            K = self.K
+        if R is None:
+            R = self.R
+        if t is None:
+            t = self.t
+        if dist_coeffs is None:
+            dist_coeffs = self.dist_coeffs
+        if orig_size is None:
+            orig_size = self.orig_size
+        vertices = projection(vertices, K, R, t, dist_coeffs, orig_size)
+
+        # from utils.vis_utils import vis_keypoints
+        # image = np.zeros((720, 1280, 3))
+        # vertices = vertices[0, :, :2]
+        # vertices[:, 0] = vertices[:, 0] * 1280
+        # vertices[:, 1] = vertices[:, 1] * 720
+        
+        # vis_image= vis_keypoints(image, vertices.detach().cpu().numpy())
+        # cv2.imwrite('vis_image.png', vis_image)
+        # import pdb; pdb.set_trace()
+
+        # rasterization
+        faces = vertices_to_faces(vertices, faces)
+        out = nr.rasterize_rgbad(
+            faces, textures, self.image_size, self.anti_aliasing, self.near, self.far, self.rasterizer_eps,
+            self.background_color)
+        return out['rgb'], out['depth'], out['alpha']
